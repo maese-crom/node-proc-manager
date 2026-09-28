@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+#
+# nproc - gestor interactivo de procesos node/npm/npx/yarn/pnpm
+#
+# Uso: nproc
+#
+# Controles:
+#   Lista:   flechas arriba/abajo, Enter (detalle), r (refrescar), q (salir)
+#   Detalle: k (cerrar SIGTERM), K (forzar SIGKILL), b (volver), r (refrescar)
+
+set -uo pipefail
+
+SELF_PID=$$
+
+PIDS=()
+PPIDS=()
+ETIMES=()
+USERS=()
+CMDS=()
+PORT_CACHE=""
+
+hide_cursor() { printf '\e[?25l'; }
+show_cursor() { printf '\e[?25h'; }
+cleanup() { show_cursor; printf '\e[0m'; clear; }
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+pad() {
+  local str="$1" len="$2" slen
+  slen=${#str}
+  if (( slen >= len )); then
+    printf '%s ' "${str:0:len-1}"
+  else
+    printf '%s%*s' "$str" "$((len - slen))" ""
+  fi
+}
+
+load_procs() {
+  PIDS=(); PPIDS=(); ETIMES=(); USERS=(); CMDS=()
+  local ps_out line pid ppid etime user cmd
+  ps_out=$(ps -axo pid=,ppid=,etime=,user=,command=)
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    [[ "$line" =~ (^|[^A-Za-z0-9_])(node|npm|npx|yarn|pnpm)([^A-Za-z0-9_]|$) ]] || continue
+    read -r pid ppid etime user cmd <<< "$line"
+    [[ "$pid" == "$SELF_PID" ]] && continue
+    [[ "$cmd" == *"/nproc"* ]] && continue
+    PIDS+=("$pid"); PPIDS+=("$ppid"); ETIMES+=("$etime"); USERS+=("$user"); CMDS+=("$cmd")
+  done <<< "$ps_out"
+  load_ports
+}
+
+load_ports() {
+  PORT_CACHE=""
+  (( ${#PIDS[@]} == 0 )) && return
+  local joined
+  joined=$(IFS=,; echo "${PIDS[*]}")
+  PORT_CACHE=$(lsof -nP -iTCP -sTCP:LISTEN -a -p "$joined" 2>/dev/null | tail -n +2)
+}
+
+ports_for_pid() {
+  local pid="$1"
+  [[ -z "$PORT_CACHE" ]] && return
+  echo "$PORT_CACHE" | awk -v p="$pid" '$2==p{print $(NF-1)}' | sed -E 's/.*:([0-9]+)$/\1/' | sort -un | paste -sd, -
+}
+
+cwd_for_pid() {
+  local pid="$1"
+  lsof -a -d cwd -p "$pid" -Fn 2>/dev/null | sed -n 's/^n//p'
+}
+
+draw_header() {
+  printf '\e[7m node-proc-manager  |  \342\206\221/\342\206\223 o j/k mover \302\267 Enter/\342\206\222 detalle \302\267 r refrescar \302\267 q salir \e[0m\n'
+  pad "PID" 7; pad "PUERTOS" 12; pad "TIEMPO" 10; pad "USER" 10; printf 'COMANDO\n'
+}
+
+draw_list() {
+  local sel="$1" count=${#PIDS[@]}
+  clear
+  draw_header
+  if (( count == 0 )); then
+    printf '\n  (no hay procesos node/npm/npx/yarn/pnpm en ejecucion)\n'
+    return
+  fi
+  local cols cmdmax i ports cmd
+  cols=$(tput cols)
+  cmdmax=$(( cols - 7 - 12 - 10 - 10 - 1 ))
+  (( cmdmax < 10 )) && cmdmax=10
+  for (( i=0; i<count; i++ )); do
+    ports=$(ports_for_pid "${PIDS[$i]}")
+    [[ -z "$ports" ]] && ports="-"
+    cmd="${CMDS[$i]}"
+    if (( ${#cmd} > cmdmax )); then
+      cmd="${cmd:0:cmdmax-1}…"
+    fi
+    (( i == sel )) && printf '\e[44;37m'
+    pad "${PIDS[$i]}" 7; pad "$ports" 12; pad "${ETIMES[$i]}" 10; pad "${USERS[$i]}" 10; printf '%s' "$cmd"
+    (( i == sel )) && printf '\e[0m'
+    printf '\n'
+  done
+}
+
+read_key() {
+  # No se usan timeouts fraccionarios: el bash de Apple (3.2.57) no los admite
+  # (rechaza "-t 0.3" con "invalid timeout specification" incluso con LC_ALL=C).
+  # Si llega ESC, asumimos que es el inicio de una secuencia de flecha y
+  # leemos el resto de forma bloqueante (el terminal la envía toda junta).
+  local k c1 c2
+  IFS= read -rsn1 k
+  if [[ "$k" == $'\x1b' ]]; then
+    IFS= read -rsn1 c1
+    k+="$c1"
+    if [[ "$c1" == "[" || "$c1" == "O" ]]; then
+      IFS= read -rsn1 c2
+      k+="$c2"
+    fi
+  fi
+  printf '%s' "$k"
+}
+
+confirm() {
+  local prompt="$1" ans
+  printf '\n%s (s/N): ' "$prompt"
+  read -r ans
+  [[ "$ans" =~ ^[sS]$ ]]
+}
+
+msg() {
+  printf '\n%s (pulsa una tecla)\n' "$1"
+  read -rsn1 _
+}
+
+show_detail() {
+  local idx="$1" pid ppid etime user cmd ports cwd key
+  while true; do
+    pid="${PIDS[$idx]}"; ppid="${PPIDS[$idx]}"; etime="${ETIMES[$idx]}"; user="${USERS[$idx]}"; cmd="${CMDS[$idx]}"
+    clear
+    ports=$(ports_for_pid "$pid")
+    [[ -z "$ports" ]] && ports="(ninguno en escucha)"
+    cwd=$(cwd_for_pid "$pid")
+    [[ -z "$cwd" ]] && cwd="(desconocido)"
+
+    printf '\e[7m Detalle del proceso \e[0m\n\n'
+    printf 'PID:        %s\n' "$pid"
+    printf 'PPID:       %s\n' "$ppid"
+    printf 'Usuario:    %s\n' "$user"
+    printf 'Tiempo:     %s\n' "$etime"
+    printf 'Puertos:    %s\n' "$ports"
+    printf 'Directorio: %s\n' "$cwd"
+    printf '\nComando completo:\n%s\n' "$cmd"
+    printf '\n\e[43;30m k) cerrar (SIGTERM)   K) forzar (SIGKILL)   \342\206\220/borrar/b) volver   r) refrescar \e[0m\n'
+
+    key=$(read_key)
+    case "$key" in
+      k)
+        if confirm "¿Cerrar el proceso $pid con SIGTERM?"; then
+          if kill -TERM "$pid" 2>/dev/null; then msg "Señal SIGTERM enviada a $pid."; else msg "Error al enviar SIGTERM."; fi
+        fi
+        ;;
+      K)
+        if confirm "¿FORZAR cierre del proceso $pid con SIGKILL?"; then
+          if kill -KILL "$pid" 2>/dev/null; then msg "Señal SIGKILL enviada a $pid."; else msg "Error al enviar SIGKILL."; fi
+        fi
+        ;;
+      b|$'\x1b[D'|$'\x1bOD'|$'\x7f'|$'\x08')
+        return
+        ;;
+      r)
+        load_procs
+        ;;
+    esac
+    if ! kill -0 "$pid" 2>/dev/null; then
+      msg "El proceso ya no existe."
+      return
+    fi
+  done
+}
+
+main() {
+  hide_cursor
+  load_procs
+  local sel=0 key count
+  while true; do
+    count=${#PIDS[@]}
+    draw_list "$sel"
+    key=$(read_key)
+    case "$key" in
+      $'\x1b[A'|$'\x1bOA'|k)
+        (( sel > 0 )) && ((sel--))
+        ;;
+      $'\x1b[B'|$'\x1bOB'|j)
+        (( sel < count - 1 )) && ((sel++))
+        ;;
+      ''|$'\n'|$'\x1b[C'|$'\x1bOC')
+        if (( count > 0 )); then
+          show_detail "$sel"
+          load_procs
+          (( sel >= ${#PIDS[@]} )) && sel=$((${#PIDS[@]} - 1))
+          (( sel < 0 )) && sel=0
+        fi
+        ;;
+      r)
+        load_procs
+        (( sel >= ${#PIDS[@]} )) && sel=$((${#PIDS[@]} - 1))
+        (( sel < 0 )) && sel=0
+        ;;
+      q)
+        break
+        ;;
+    esac
+  done
+}
+
+main
